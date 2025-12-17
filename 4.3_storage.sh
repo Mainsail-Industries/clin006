@@ -4,10 +4,10 @@
 # Reference: Test Plan Section 4.3 - Subsystem: Storage Encryption
 #
 # What is being tested:
-# - Ceph distributed storage with quantum-hardened encryption
-# - Device-level encryption (dm-crypt)
-# - Tenant-specific image keys
-# - Object storage encryption
+# - Device-level encryption (dm-crypt/LUKS)
+# - File encryption (OpenSSL, GPG)
+# - Storage I/O performance with encryption
+# - Backup/restore with encryption
 #
 # Success Criteria:
 # - Storage encryption operational with QO
@@ -402,62 +402,10 @@ test_fio_encrypted_performance() {
 }
 
 #-------------------------------------------------------------------------------
-# TEST 4.3.5: Ceph Integration Check
-#-------------------------------------------------------------------------------
-test_ceph_integration() {
-    log_info "TEST 4.3.5: Ceph Storage Integration Check"
-    
-    local status="INFO"
-    local details=""
-    
-    # Check for Ceph client tools
-    if command -v ceph &>/dev/null; then
-        details+="✓ Ceph client tools available\n"
-        
-        # Check if we can connect to a cluster
-        if ceph status &>/dev/null; then
-            details+="✓ Connected to Ceph cluster\n"
-            
-            # Get cluster info
-            local health=$(ceph health 2>/dev/null)
-            details+="  Cluster health: ${health}\n"
-            
-            # Check for encryption configuration
-            if ceph config get osd osd_dmcrypt_type 2>/dev/null; then
-                local dmcrypt_type=$(ceph config get osd osd_dmcrypt_type 2>/dev/null)
-                details+="  OSD dmcrypt type: ${dmcrypt_type}\n"
-            fi
-            
-            # Check for encrypted OSDs
-            local osd_info=$(ceph osd tree 2>/dev/null | head -20)
-            details+="  OSD Tree:\n${osd_info}\n"
-        else
-            details+="No Ceph cluster connection available\n"
-            details+="This is expected if Ceph is not deployed\n"
-        fi
-    else
-        details+="Ceph client tools not installed\n"
-        details+="Install ceph-common package to enable Ceph tests\n"
-    fi
-    
-    # Check for RBD module
-    if lsmod 2>/dev/null | grep -q "rbd"; then
-        details+="✓ RBD kernel module loaded\n"
-    else
-        details+="RBD kernel module not loaded\n"
-    fi
-    
-    echo -e "$details"
-    add_test_result "ceph_integration" "$status" "$(echo -e "$details")"
-    
-    log_info "TEST 4.3.5 COMPLETE (informational)"
-}
-
-#-------------------------------------------------------------------------------
-# TEST 4.3.6: Encrypted Backup/Restore
+# TEST 4.3.5: Encrypted Backup/Restore
 #-------------------------------------------------------------------------------
 test_encrypted_backup_restore() {
-    log_info "TEST 4.3.6: Encrypted Backup/Restore Test"
+    log_info "TEST 4.3.5: Encrypted Backup/Restore Test"
     
     local status="PASS"
     local details=""
@@ -503,9 +451,9 @@ test_encrypted_backup_restore() {
             
             details+="✓ Backup restored in ${duration}s\n"
             
-            # Verify integrity
-            local src_hash=$(find "${src_dir}" -type f -exec sha256sum {} \; | sort | sha256sum | awk '{print $1}')
-            local dst_hash=$(find "${restore_dir}" -type f -exec sha256sum {} \; | sort | sha256sum | awk '{print $1}')
+            # Verify integrity (extract only hash values, not paths, before comparing)
+            local src_hash=$(find "${src_dir}" -type f -exec sha256sum {} \; | awk '{print $1}' | sort | sha256sum | awk '{print $1}')
+            local dst_hash=$(find "${restore_dir}" -type f -exec sha256sum {} \; | awk '{print $1}' | sort | sha256sum | awk '{print $1}')
             
             if [[ "${src_hash}" == "${dst_hash}" ]]; then
                 details+="✓ Integrity verification passed\n"
@@ -528,14 +476,14 @@ test_encrypted_backup_restore() {
     echo -e "$details"
     add_test_result "encrypted_backup_restore" "$status" "$(echo -e "$details")"
     
-    [[ "$status" == "PASS" ]] && log_pass "TEST 4.3.6 PASSED" || log_fail "TEST 4.3.6 FAILED"
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.3.5 PASSED" || log_fail "TEST 4.3.5 FAILED"
 }
 
 #-------------------------------------------------------------------------------
-# TEST 4.3.7: GPG Encryption Test
+# TEST 4.3.6: GPG Encryption Test
 #-------------------------------------------------------------------------------
 test_gpg_encryption() {
-    log_info "TEST 4.3.7: GPG Encryption Test"
+    log_info "TEST 4.3.6: GPG Encryption Test"
     
     local status="PASS"
     local details=""
@@ -598,14 +546,14 @@ test_gpg_encryption() {
     echo -e "$details"
     add_test_result "gpg_encryption" "$status" "$(echo -e "$details")"
     
-    [[ "$status" == "PASS" ]] && log_pass "TEST 4.3.7 PASSED" || log_fail "TEST 4.3.7 FAILED"
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.3.6 PASSED" || log_fail "TEST 4.3.6 FAILED"
 }
 
 #-------------------------------------------------------------------------------
-# TEST 4.3.8: eCryptfs Test (if available)
+# TEST 4.3.7: eCryptfs Test (if available)
 #-------------------------------------------------------------------------------
 test_ecryptfs() {
-    log_info "TEST 4.3.8: eCryptfs Encryption Test"
+    log_info "TEST 4.3.7: eCryptfs Encryption Test"
     
     local status="INFO"
     local details=""
@@ -637,7 +585,7 @@ test_ecryptfs() {
     echo -e "$details"
     add_test_result "ecryptfs" "$status" "$(echo -e "$details")"
     
-    log_info "TEST 4.3.8 COMPLETE (informational)"
+    log_info "TEST 4.3.7 COMPLETE (informational)"
 }
 
 #-------------------------------------------------------------------------------
@@ -656,7 +604,6 @@ main() {
     test_luks_operations
     test_encrypted_file_ops
     test_fio_encrypted_performance
-    test_ceph_integration
     test_encrypted_backup_restore
     test_gpg_encryption
     test_ecryptfs

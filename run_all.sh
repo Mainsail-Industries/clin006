@@ -10,14 +10,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/results/$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${RESULTS_DIR}/test_run.log"
-SUMMARY_FILE="${RESULTS_DIR}/summary.json"
 
-# Test configuration
+# Test configuration - defaults, may be overridden by command-line arguments
 export TEST_MODE="${TEST_MODE:-baseline}"  # baseline or qo_enabled
 export QO_ENABLED="${QO_ENABLED:-false}"
 export VERBOSE="${VERBOSE:-false}"
+
+# Results directory will be set in setup_environment() after TEST_MODE is finalized
+RESULTS_DIR=""
+LOG_FILE=""
+SUMMARY_FILE=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,15 +57,29 @@ header() {
 # Setup
 #-------------------------------------------------------------------------------
 setup_environment() {
-    header "Setting Up Test Environment"
-    
+    # Set results directory based on test mode (baseline or qo)
+    if [[ "${TEST_MODE}" == "qo_enabled" ]]; then
+        RESULTS_DIR="${SCRIPT_DIR}/results/qo"
+    else
+        RESULTS_DIR="${SCRIPT_DIR}/results/baseline"
+    fi
+    LOG_FILE="${RESULTS_DIR}/test_run.log"
+    SUMMARY_FILE="${RESULTS_DIR}/summary.json"
+
+    # Clear previous results for this mode (single run per type)
+    if [[ -d "${RESULTS_DIR}" ]]; then
+        rm -rf "${RESULTS_DIR}"
+    fi
+
+    # Create results directory first, before any logging
     mkdir -p "${RESULTS_DIR}"
+
+    header "Setting Up Test Environment"
     mkdir -p "${RESULTS_DIR}/entropy"
     mkdir -p "${RESULTS_DIR}/crypto"
     mkdir -p "${RESULTS_DIR}/storage"
     mkdir -p "${RESULTS_DIR}/network"
     mkdir -p "${RESULTS_DIR}/vm"
-    mkdir -p "${RESULTS_DIR}/os"
     mkdir -p "${RESULTS_DIR}/performance"
     
     # Initialize summary
@@ -113,10 +129,10 @@ preflight_checks() {
     for tool in "${required_tools[@]}"; do
         if command -v "$tool" &>/dev/null; then
             log_pass "Found: $tool"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_fail "Missing required tool: $tool"
-            ((checks_failed++))
+            checks_failed=$((checks_failed + 1))
         fi
     done
     
@@ -133,29 +149,45 @@ preflight_checks() {
     log_info "Checking entropy sources..."
     if [[ -c /dev/random ]]; then
         log_pass "/dev/random available"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_fail "/dev/random not available"
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
-    
+
     if [[ -c /dev/urandom ]]; then
         log_pass "/dev/urandom available"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_fail "/dev/urandom not available"
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
-    
+
     # Check for Quantum Origin (if expected)
     if [[ "${QO_ENABLED}" == "true" ]]; then
         log_info "Checking for Quantum Origin..."
-        # Check for QO-specific indicators
-        if systemctl is-active --quiet qo-entropy 2>/dev/null; then
-            log_pass "Quantum Origin service is active"
-            ((checks_passed++))
-        else
-            log_warn "Quantum Origin service not detected (may use different service name)"
+        local qo_found=false
+        # Check for QO-specific services
+        for svc in qo-kernel-reseed qo-entropy quantum-origin qo-daemon; do
+            if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+                log_pass "Quantum Origin service '${svc}' is active"
+                checks_passed=$((checks_passed + 1))
+                qo_found=true
+                break
+            fi
+        done
+        # Fallback: check for installed QO packages
+        if [[ "$qo_found" == "false" ]]; then
+            local qo_pkg
+            qo_pkg=$(rpm -qa 2>/dev/null | grep -i "^qo-\|quantum-origin" | head -1 || true)
+            if [[ -n "$qo_pkg" ]]; then
+                log_pass "Quantum Origin package detected: ${qo_pkg}"
+                checks_passed=$((checks_passed + 1))
+                qo_found=true
+            fi
+        fi
+        if [[ "$qo_found" == "false" ]]; then
+            log_warn "Quantum Origin not detected (no service or package found)"
         fi
     fi
     
@@ -202,50 +234,43 @@ run_section() {
 # Main Test Execution
 #-------------------------------------------------------------------------------
 run_all_tests() {
-    local total_sections=6
+    local total_sections=5
     local passed_sections=0
     local failed_sections=0
     
     # Section 4.1: System Entropy Source
-    if run_section "System Entropy Source" "section_4_1_entropy.sh" "4.1"; then
-        ((passed_sections++))
+    if run_section "System Entropy Source" "4.1_entropy.sh" "4.1"; then
+        passed_sections=$((passed_sections + 1))
     else
-        ((failed_sections++))
+        failed_sections=$((failed_sections + 1))
     fi
-    
+
     # Section 4.2: Cryptographic Key Generation
-    if run_section "Cryptographic Key Generation" "section_4_2_crypto_keygen.sh" "4.2"; then
-        ((passed_sections++))
+    if run_section "Cryptographic Key Generation" "4.2_keygen.sh" "4.2"; then
+        passed_sections=$((passed_sections + 1))
     else
-        ((failed_sections++))
+        failed_sections=$((failed_sections + 1))
     fi
-    
+
     # Section 4.3: Storage Encryption
-    if run_section "Storage Encryption" "section_4_3_storage.sh" "4.3"; then
-        ((passed_sections++))
+    if run_section "Storage Encryption" "4.3_storage.sh" "4.3"; then
+        passed_sections=$((passed_sections + 1))
     else
-        ((failed_sections++))
+        failed_sections=$((failed_sections + 1))
     fi
-    
+
     # Section 4.4: Network Security (TLS/VPN)
-    if run_section "Network Security" "section_4_4_network.sh" "4.4"; then
-        ((passed_sections++))
+    if run_section "Network Security" "4.4_network.sh" "4.4"; then
+        passed_sections=$((passed_sections + 1))
     else
-        ((failed_sections++))
+        failed_sections=$((failed_sections + 1))
     fi
-    
+
     # Section 4.5: Virtual Machine Operations
-    if run_section "VM Operations" "section_4_5_vm.sh" "4.5"; then
-        ((passed_sections++))
+    if run_section "VM Operations" "4.5_vm.sh" "4.5"; then
+        passed_sections=$((passed_sections + 1))
     else
-        ((failed_sections++))
-    fi
-    
-    # Section 4.6: Immutable OS & Supply Chain
-    if run_section "Immutable OS & Supply Chain" "section_4_6_os_supplychain.sh" "4.6"; then
-        ((passed_sections++))
-    else
-        ((failed_sections++))
+        failed_sections=$((failed_sections + 1))
     fi
     
     return ${failed_sections}

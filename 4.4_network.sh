@@ -132,15 +132,20 @@ test_openssl_tls_capabilities() {
     
     # List ciphers
     log_info "Checking available cipher suites..."
-    local tls13_ciphers=$(openssl ciphers -v 'TLSv1.3' 2>/dev/null | wc -l)
-    local tls12_ciphers=$(openssl ciphers -v 'TLSv1.2' 2>/dev/null | wc -l)
-    
+
+    # TLS 1.3 ciphersuites are handled separately in OpenSSL 3.x
+    local tls13_ciphers=$(openssl ciphers -s -tls1_3 2>/dev/null | tr ':' '\n' | wc -l)
+    local tls12_ciphers=$(openssl ciphers -v 'HIGH:!aNULL:!MD5' 2>/dev/null | wc -l)
+
     details+="Available cipher suites:\n"
-    details+="  TLS 1.3: ${tls13_ciphers} ciphers\n"
+    details+="  TLS 1.3: ${tls13_ciphers} ciphersuites\n"
     details+="  TLS 1.2: ${tls12_ciphers} ciphers\n"
-    
-    # Check for strong ciphers
-    if openssl ciphers 'TLSv1.3' 2>/dev/null | grep -qi "AES.*GCM\|CHACHA20"; then
+
+    # Check for strong AEAD ciphers (TLS 1.3 always uses AEAD)
+    local tls13_list=$(openssl ciphers -s -tls1_3 2>/dev/null)
+    if [[ -n "${tls13_list}" ]] && echo "${tls13_list}" | grep -qi "AES.*GCM\|CHACHA20"; then
+        details+="✓ Strong AEAD ciphers available (TLS 1.3)\n"
+    elif openssl ciphers 'AESGCM:CHACHA20' 2>/dev/null | grep -qi "AES\|CHACHA"; then
         details+="✓ Strong AEAD ciphers available\n"
     else
         status="WARN"
@@ -260,17 +265,17 @@ test_tls_performance() {
         
         for i in $(seq 1 ${iterations}); do
             local start=$(date +%s.%N)
-            
+
             if echo "Q" | timeout 5 openssl s_client \
                 -connect localhost:${TEST_PORT} \
                 -tls1_3 \
                 -CAfile "${CERTS_DIR}/ca.crt" \
                 > /dev/null 2>&1; then
-                
+
                 local end=$(date +%s.%N)
                 local duration=$(echo "${end} - ${start}" | bc)
                 total_time=$(echo "${total_time} + ${duration}" | bc)
-                ((successful++))
+                successful=$((successful + 1))
             fi
         done
         

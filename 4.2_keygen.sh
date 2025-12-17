@@ -578,7 +578,7 @@ test_luks_key_derivation() {
     
     # Create a test file for LUKS container
     local test_file="${SECTION_DIR}/luks_test.img"
-    local test_size=10  # MB
+    local test_size=32  # MB (LUKS2 header requires ~16MB)
     
     log_info "Creating test LUKS container..."
     

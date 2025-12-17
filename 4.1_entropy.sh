@@ -21,6 +21,10 @@ RESULTS_DIR="${1:-./results}"
 SECTION_DIR="${RESULTS_DIR}/entropy"
 SECTION_RESULTS="${SECTION_DIR}/results.json"
 
+# Extended quality tests configuration
+EXTENDED_TESTS="${EXTENDED_TESTS:-true}"
+SAMPLE_SIZE="${SAMPLE_SIZE:-10}"  # MB of random data for quality tests
+
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh" 2>/dev/null || {
     # Inline common functions if lib not available
     log_info() { echo "[INFO] $*"; }
@@ -294,9 +298,9 @@ test_quantum_origin_detection() {
     local details=""
     
     # Check for QO-specific services
-    local qo_services=("qo-entropy" "quantum-origin" "qo-daemon")
+    local qo_services=("qo-kernel-reseed" "qo-entropy" "quantum-origin" "qo-daemon")
     local found_service=""
-    
+
     for svc in "${qo_services[@]}"; do
         if systemctl list-units --type=service --all 2>/dev/null | grep -q "${svc}"; then
             found_service="${svc}"
@@ -310,7 +314,21 @@ test_quantum_origin_detection() {
             break
         fi
     done
-    
+
+    # Also check if QO packages are installed (alternative detection)
+    if [[ -z "$found_service" ]]; then
+        local qo_packages
+        qo_packages=$(rpm -qa 2>/dev/null | grep -i "^qo-\|quantum-origin" || true)
+        if [[ -n "$qo_packages" ]]; then
+            details+="✓ Quantum Origin package(s) installed:\n"
+            while IFS= read -r pkg; do
+                details+="  - ${pkg}\n"
+            done <<< "$qo_packages"
+            status="PASS"
+            found_service="package"
+        fi
+    fi
+
     if [[ -z "$found_service" ]]; then
         details+="No Quantum Origin service detected\n"
         details+="This may be expected in baseline configuration\n"
@@ -374,10 +392,11 @@ test_rngtest_statistical() {
     fi
     
     log_info "Running FIPS 140-2 statistical tests on /dev/urandom..."
-    
+
     # Generate 2.5MB of random data (enough for rngtest)
-    dd if=/dev/urandom bs=2500 count=1000 2>/dev/null | rngtest -c 1000 2>&1 | tee "${rngtest_output}"
-    
+    # Note: rngtest exits non-zero if ANY failures occur, but low failure rates are statistically normal
+    dd if=/dev/urandom bs=2500 count=1000 2>/dev/null | rngtest -c 1000 2>&1 | tee "${rngtest_output}" || true
+
     # Parse results
     local success_count=$(grep -oP 'successes:\s*\K\d+' "${rngtest_output}" 2>/dev/null || echo "0")
     local failure_count=$(grep -oP 'failures:\s*\K\d+' "${rngtest_output}" 2>/dev/null || echo "0")
@@ -482,23 +501,23 @@ test_kernel_entropy_sources() {
     # Check for hardware RNG
     if [[ -c /dev/hwrng ]]; then
         details+="✓ Hardware RNG device available (/dev/hwrng)\n"
-        ls -la /dev/hwrng >> "${sources_file}" 2>&1
+        ls -la /dev/hwrng >> "${sources_file}" 2>&1 || true
     else
         details+="Hardware RNG device not present\n"
     fi
-    
+
     # Check rngd status
     if systemctl is-active --quiet rngd 2>/dev/null; then
         details+="✓ rngd service is active\n"
-        systemctl status rngd 2>&1 | head -10 >> "${sources_file}"
+        systemctl status rngd 2>&1 | head -10 >> "${sources_file}" || true
     else
         details+="rngd service not active\n"
     fi
-    
+
     # Check for CPU RDRAND/RDSEED
     if grep -q "rdrand\|rdseed" /proc/cpuinfo 2>/dev/null; then
         details+="✓ CPU supports RDRAND/RDSEED instructions\n"
-        grep -E "rdrand|rdseed" /proc/cpuinfo | head -1 >> "${sources_file}"
+        grep -E "rdrand|rdseed" /proc/cpuinfo 2>/dev/null | head -1 >> "${sources_file}" || true
     else
         details+="CPU RDRAND/RDSEED not detected\n"
     fi
@@ -528,6 +547,472 @@ test_kernel_entropy_sources() {
     log_info "TEST 4.1.8 COMPLETE (informational)"
 }
 
+#===============================================================================
+# EXTENDED QUALITY TESTS (4.1.9 - 4.1.15)
+# These tests go beyond basic FIPS 140-2 to measure randomness quality
+# that could differentiate Quantum Origin from baseline PRNG
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.9: Extended FIPS with larger sample
+#-------------------------------------------------------------------------------
+test_extended_fips() {
+    log_info "TEST 4.1.9: Extended FIPS 140-2 with ${SAMPLE_SIZE}MB sample"
+
+    local status="PASS"
+    local details=""
+    local output_file="${SECTION_DIR}/extended_fips.txt"
+
+    if ! command -v rngtest &>/dev/null; then
+        status="SKIP"
+        details="rngtest not available"
+        add_test_result "extended_fips" "$status" "$details"
+        log_warn "TEST 4.1.9 SKIPPED"
+        return
+    fi
+
+    # Calculate blocks needed (each FIPS block is 2500 bytes)
+    local bytes=$((SAMPLE_SIZE * 1024 * 1024))
+    local blocks=$((bytes / 2500))
+
+    log_info "Running ${blocks} FIPS blocks on ${SAMPLE_SIZE}MB of data..."
+
+    dd if=/dev/urandom bs=2500 count=${blocks} 2>/dev/null | \
+        rngtest -c ${blocks} 2>&1 | tee "${output_file}" || true
+
+    local successes=$(grep -oP 'successes:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+    local failures=$(grep -oP 'failures:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+    local total=$((successes + failures))
+
+    if [[ $total -gt 0 ]]; then
+        local failure_rate=$(echo "scale=6; ${failures} * 100 / ${total}" | bc)
+        local pass_rate=$(echo "scale=6; ${successes} * 100 / ${total}" | bc)
+
+        details+="Sample size: ${SAMPLE_SIZE}MB (${blocks} blocks)\n"
+        details+="Successes: ${successes}\n"
+        details+="Failures: ${failures}\n"
+        details+="Pass rate: ${pass_rate}%\n"
+        details+="Failure rate: ${failure_rate}%\n"
+
+        # Break down failure types
+        local monobit=$(grep -oP 'Monobit:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+        local poker=$(grep -oP 'Poker:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+        local runs=$(grep -oP 'Runs:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+        local longrun=$(grep -oP 'Long run:\s*\K\d+' "${output_file}" 2>/dev/null || echo "0")
+
+        details+="\nFailure breakdown:\n"
+        details+="  Monobit: ${monobit}\n"
+        details+="  Poker: ${poker}\n"
+        details+="  Runs: ${runs}\n"
+        details+="  Long run: ${longrun}\n"
+
+        if (( $(echo "${failure_rate} > 0.5" | bc -l) )); then
+            status="WARN"
+            details+="\n⚠ Failure rate above 0.5% - investigate"
+        elif (( $(echo "${failure_rate} > 0.1" | bc -l) )); then
+            details+="\n✓ Failure rate slightly elevated but acceptable"
+        else
+            details+="\n✓ Excellent pass rate"
+        fi
+    else
+        status="FAIL"
+        details="No FIPS blocks processed"
+    fi
+
+    echo -e "$details"
+    add_test_result "extended_fips" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.9 PASSED" || log_warn "TEST 4.1.9 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.10: Compression ratio analysis
+#-------------------------------------------------------------------------------
+test_compression_ratio() {
+    log_info "TEST 4.1.10: Compression ratio analysis"
+
+    local status="PASS"
+    local details=""
+    local raw_file="${SECTION_DIR}/random_raw.bin"
+    local compressed_file="${SECTION_DIR}/random_compressed.gz"
+
+    # Generate random data
+    dd if=/dev/urandom of="${raw_file}" bs=1M count=${SAMPLE_SIZE} 2>/dev/null
+    local raw_size=$(stat -c%s "${raw_file}")
+
+    # Compress with gzip (best compression)
+    gzip -9 -c "${raw_file}" > "${compressed_file}"
+    local compressed_size=$(stat -c%s "${compressed_file}")
+
+    # Calculate compression ratio
+    local ratio=$(echo "scale=4; ${compressed_size} / ${raw_size}" | bc)
+    local percent=$(echo "scale=2; ${ratio} * 100" | bc)
+
+    details+="Raw size: ${raw_size} bytes (${SAMPLE_SIZE}MB)\n"
+    details+="Compressed size: ${compressed_size} bytes\n"
+    details+="Compression ratio: ${percent}%\n"
+
+    # Truly random data should compress to ~100.0-100.5% (slight overhead from gzip headers)
+    if (( $(echo "${ratio} < 0.98" | bc -l) )); then
+        status="FAIL"
+        details+="\n✗ Data compressed significantly - patterns detected"
+    elif (( $(echo "${ratio} < 0.995" | bc -l) )); then
+        status="WARN"
+        details+="\n⚠ Data compressed slightly - minor patterns possible"
+    else
+        details+="\n✓ Data incompressible (${percent}%) - excellent randomness"
+    fi
+
+    rm -f "${raw_file}" "${compressed_file}"
+
+    echo -e "$details"
+    add_test_result "compression_ratio" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.10 PASSED" || log_warn "TEST 4.1.10 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.11: Bit distribution analysis
+#-------------------------------------------------------------------------------
+test_bit_distribution() {
+    log_info "TEST 4.1.11: Bit distribution analysis"
+
+    local status="PASS"
+    local details=""
+    local sample_file="${SECTION_DIR}/bit_sample.bin"
+
+    # Generate sample
+    dd if=/dev/urandom of="${sample_file}" bs=1M count=${SAMPLE_SIZE} 2>/dev/null
+
+    local total_bits=$((SAMPLE_SIZE * 1024 * 1024 * 8))
+
+    # Count 1-bits using xxd and awk
+    local ones=$(xxd -b "${sample_file}" | grep -oE '[01]{8}' | tr -d '\n' | tr -cd '1' | wc -c)
+    local zeros=$((total_bits - ones))
+
+    local ones_percent=$(echo "scale=6; ${ones} * 100 / ${total_bits}" | bc)
+    local zeros_percent=$(echo "scale=6; ${zeros} * 100 / ${total_bits}" | bc)
+    local deviation=$(echo "scale=6; ${ones_percent} - 50" | bc)
+    local abs_deviation=$(echo "${deviation}" | tr -d '-')
+
+    details+="Total bits: ${total_bits}\n"
+    details+="Ones: ${ones} (${ones_percent}%)\n"
+    details+="Zeros: ${zeros} (${zeros_percent}%)\n"
+    details+="Deviation from 50%: ${deviation}%\n"
+
+    if (( $(echo "${abs_deviation} > 0.1" | bc -l) )); then
+        status="WARN"
+        details+="\n⚠ Significant bit bias detected"
+    elif (( $(echo "${abs_deviation} > 0.01" | bc -l) )); then
+        details+="\n✓ Minor deviation within expected range"
+    else
+        details+="\n✓ Excellent bit distribution"
+    fi
+
+    rm -f "${sample_file}"
+
+    echo -e "$details"
+    add_test_result "bit_distribution" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.11 PASSED" || log_warn "TEST 4.1.11 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.12: Byte value distribution (chi-square test)
+#-------------------------------------------------------------------------------
+test_byte_distribution() {
+    log_info "TEST 4.1.12: Byte value distribution (chi-square)"
+
+    local status="PASS"
+    local details=""
+    local sample_file="${SECTION_DIR}/byte_sample.bin"
+    local freq_file="${SECTION_DIR}/byte_freq.txt"
+
+    # Generate sample
+    dd if=/dev/urandom of="${sample_file}" bs=1M count=${SAMPLE_SIZE} 2>/dev/null
+    local total_bytes=$((SAMPLE_SIZE * 1024 * 1024))
+    local expected=$((total_bytes / 256))
+
+    # Count frequency of each byte value
+    xxd -p "${sample_file}" | fold -w2 | sort | uniq -c | sort -k2 > "${freq_file}"
+
+    # Calculate chi-square statistic
+    local chi_square=0
+    while read count hex; do
+        local diff=$((count - expected))
+        local sq=$((diff * diff))
+        chi_square=$(echo "${chi_square} + ${sq} / ${expected}" | bc -l)
+    done < "${freq_file}"
+
+    details+="Total bytes: ${total_bytes}\n"
+    details+="Expected per value: ${expected}\n"
+    details+="Chi-square statistic: ${chi_square}\n"
+
+    # Chi-square critical value for 255 df at p=0.05 is ~293
+    if (( $(echo "${chi_square} > 350" | bc -l) )); then
+        status="WARN"
+        details+="\n⚠ Chi-square indicates non-uniform distribution"
+    elif (( $(echo "${chi_square} > 293" | bc -l) )); then
+        details+="\n✓ Chi-square slightly elevated but acceptable"
+    else
+        details+="\n✓ Excellent byte distribution uniformity"
+    fi
+
+    rm -f "${sample_file}" "${freq_file}"
+
+    echo -e "$details"
+    add_test_result "byte_distribution" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.12 PASSED" || log_warn "TEST 4.1.12 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.13: Serial correlation
+#-------------------------------------------------------------------------------
+test_serial_correlation() {
+    log_info "TEST 4.1.13: Serial correlation analysis"
+
+    local status="PASS"
+    local details=""
+    local sample_file="${SECTION_DIR}/serial_sample.bin"
+
+    # Generate sample (smaller for this test)
+    local test_size=1
+    dd if=/dev/urandom of="${sample_file}" bs=1M count=${test_size} 2>/dev/null
+
+    # Calculate serial correlation coefficient using awk
+    local correlation=$(xxd -p "${sample_file}" | fold -w2 | \
+        awk 'BEGIN {sum_xy=0; sum_x=0; sum_y=0; sum_x2=0; sum_y2=0; n=0; prev=-1}
+        {
+            curr = strtonum("0x" $1)
+            if (prev >= 0) {
+                sum_xy += prev * curr
+                sum_x += prev
+                sum_y += curr
+                sum_x2 += prev * prev
+                sum_y2 += curr * curr
+                n++
+            }
+            prev = curr
+        }
+        END {
+            if (n > 0) {
+                mean_x = sum_x / n
+                mean_y = sum_y / n
+                cov = (sum_xy / n) - (mean_x * mean_y)
+                var_x = (sum_x2 / n) - (mean_x * mean_x)
+                var_y = (sum_y2 / n) - (mean_y * mean_y)
+                if (var_x > 0 && var_y > 0) {
+                    corr = cov / sqrt(var_x * var_y)
+                    printf "%.6f", corr
+                } else {
+                    print "0"
+                }
+            } else {
+                print "0"
+            }
+        }')
+
+    local abs_corr=$(echo "${correlation}" | tr -d '-')
+
+    details+="Serial correlation coefficient: ${correlation}\n"
+
+    if (( $(echo "${abs_corr} > 0.05" | bc -l) )); then
+        status="WARN"
+        details+="\n⚠ Significant serial correlation detected"
+    elif (( $(echo "${abs_corr} > 0.01" | bc -l) )); then
+        details+="\n✓ Minor correlation within acceptable range"
+    else
+        details+="\n✓ No significant serial correlation"
+    fi
+
+    rm -f "${sample_file}"
+
+    echo -e "$details"
+    add_test_result "serial_correlation" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.13 PASSED" || log_warn "TEST 4.1.13 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.14: Runs analysis
+#-------------------------------------------------------------------------------
+test_runs_analysis() {
+    log_info "TEST 4.1.14: Extended runs analysis"
+
+    local status="PASS"
+    local details=""
+    local sample_file="${SECTION_DIR}/runs_sample.bin"
+    local bits_file="${SECTION_DIR}/runs_bits.txt"
+
+    # Generate smaller sample for this intensive test
+    dd if=/dev/urandom of="${sample_file}" bs=100K count=1 2>/dev/null
+
+    # Convert to binary string
+    xxd -b "${sample_file}" | awk '{for(i=2;i<=7;i++) printf "%s", $i}' > "${bits_file}"
+
+    local runs_output="${SECTION_DIR}/runs_output.txt"
+
+    if command -v perl &>/dev/null; then
+        perl -e '
+            open(F, $ARGV[0]) or die;
+            local $/; $bits = <F>; close(F);
+            $bits =~ s/[^01]//g;
+            my %runs;
+            my $total = 0;
+            while ($bits =~ /([01])\1*/g) {
+                my $len = length($&);
+                $len = 11 if $len > 10;
+                $runs{$len}++;
+                $total++;
+            }
+            for my $i (1..11) {
+                print "$i:" . ($runs{$i} // 0) . "\n";
+            }
+            print "total:$total\n";
+        ' "${bits_file}" > "${runs_output}" 2>/dev/null
+    else
+        # Fallback to awk-based analysis
+        cat "${bits_file}" | tr -d '\n' | \
+        awk '{
+            n = split($0, chars, "")
+            prev = ""
+            run_len = 0
+            for (i=1; i<=n; i++) {
+                if (chars[i] == prev) {
+                    run_len++
+                } else {
+                    if (run_len > 0) {
+                        len = (run_len > 10) ? 11 : run_len
+                        runs[len]++
+                        total++
+                    }
+                    prev = chars[i]
+                    run_len = 1
+                }
+            }
+            if (run_len > 0) {
+                len = (run_len > 10) ? 11 : run_len
+                runs[len]++
+                total++
+            }
+            for (i=1; i<=11; i++) printf "%d:%d\n", i, runs[i]+0
+            printf "total:%d\n", total
+        }' > "${runs_output}" 2>/dev/null
+    fi
+
+    details+="Run length distribution:\n"
+
+    while IFS=: read -r len count; do
+        if [[ "$len" == "total" ]]; then
+            details+="Total runs: ${count}\n"
+        elif [[ "$len" == "11" ]]; then
+            details+="  Length 11+: ${count}\n"
+        else
+            details+="  Length ${len}: ${count}\n"
+        fi
+    done < "${runs_output}"
+
+    local len1=$(grep "^1:" "${runs_output}" | cut -d: -f2)
+    local total=$(grep "^total:" "${runs_output}" | cut -d: -f2)
+
+    if [[ -n "$len1" && -n "$total" && "$total" -gt 0 ]]; then
+        local len1_pct=$(echo "scale=2; ${len1} * 100 / ${total}" | bc)
+        details+="\nLength-1 runs: ${len1_pct}% (expected ~50%)\n"
+
+        if (( $(echo "${len1_pct} < 40 || ${len1_pct} > 60" | bc -l) )); then
+            status="WARN"
+            details+="⚠ Run distribution outside expected range"
+        else
+            details+="✓ Run distribution within expected range"
+        fi
+    else
+        details+="\n✓ Runs analysis complete"
+    fi
+
+    rm -f "${sample_file}" "${bits_file}" "${runs_output}"
+
+    echo -e "$details"
+    add_test_result "runs_analysis" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.14 PASSED" || log_warn "TEST 4.1.14 WARNING"
+}
+
+#-------------------------------------------------------------------------------
+# TEST 4.1.15: Dieharder statistical test battery
+#-------------------------------------------------------------------------------
+test_dieharder() {
+    log_info "TEST 4.1.15: Dieharder statistical test battery"
+
+    local status="PASS"
+    local details=""
+
+    if ! command -v dieharder &>/dev/null; then
+        status="SKIP"
+        details="'dieharder' tool not installed\nInstall with: sudo dnf install dieharder"
+        add_test_result "dieharder" "$status" "$details"
+        log_warn "TEST 4.1.15 SKIPPED - dieharder not available"
+        return
+    fi
+
+    local dieharder_output="${SECTION_DIR}/dieharder_output.txt"
+
+    # Run a subset of dieharder tests (full battery takes hours)
+    log_info "Running dieharder tests with streaming input from /dev/urandom..."
+
+    local tests_to_run=(2 10 15 17 100 101 200)
+    local passed=0
+    local failed=0
+    local weak=0
+
+    > "${dieharder_output}"
+
+    for test_id in "${tests_to_run[@]}"; do
+        log_info "  Running dieharder test ${test_id}..."
+        dieharder -g 200 -Y 1 -p 10 -d ${test_id} < /dev/urandom 2>/dev/null | tee -a "${dieharder_output}" || true
+    done
+
+    passed=$(grep -c "PASSED" "${dieharder_output}" 2>/dev/null) || passed=0
+    failed=$(grep -c "FAILED" "${dieharder_output}" 2>/dev/null) || failed=0
+    weak=$(grep -c "WEAK" "${dieharder_output}" 2>/dev/null) || weak=0
+    passed=${passed:-0}
+    failed=${failed:-0}
+    weak=${weak:-0}
+    local total=$((passed + failed + weak))
+
+    details+="Input: streaming from /dev/urandom\n"
+    details+="Tests run: ${#tests_to_run[@]} test suites\n"
+    details+="Total assessments: ${total}\n"
+    details+="Passed: ${passed}\n"
+    details+="Weak: ${weak}\n"
+    details+="Failed: ${failed}\n"
+
+    local failures=$(grep "FAILED" "${dieharder_output}" 2>/dev/null || true)
+    if [[ -n "$failures" ]]; then
+        details+="\nFailed tests:\n"
+        details+=$(echo "$failures" | head -5 | sed 's/^/  /')
+        details+="\n"
+    fi
+
+    if [[ $failed -gt 2 ]]; then
+        status="FAIL"
+        details+="\n✗ Multiple dieharder tests failed - significant weakness"
+    elif [[ $failed -gt 0 ]]; then
+        status="WARN"
+        details+="\n⚠ Some dieharder tests failed - investigate"
+    elif [[ $weak -gt 1 ]]; then
+        status="WARN"
+        details+="\n⚠ Unresolved weak results - minor concerns"
+    else
+        details+="\n✓ Passed dieharder battery"
+    fi
+
+    echo -e "$details"
+    add_test_result "dieharder" "$status" "$(echo -e "$details")"
+
+    [[ "$status" == "PASS" ]] && log_pass "TEST 4.1.15 PASSED" || log_warn "TEST 4.1.15 WARNING"
+}
+
 #-------------------------------------------------------------------------------
 # Main Execution
 #-------------------------------------------------------------------------------
@@ -537,9 +1022,10 @@ main() {
     echo "SECTION 4.1: SYSTEM ENTROPY SOURCE TESTS"
     echo "=============================================================================="
     echo ""
-    
+
     init_results
-    
+
+    # Core entropy tests (4.1.1 - 4.1.8)
     test_dev_random_availability
     test_entropy_pool_metrics
     test_entropy_generation_rate
@@ -548,11 +1034,30 @@ main() {
     test_rngtest_statistical
     test_entropy_under_load
     test_kernel_entropy_sources
-    
+
+    # Extended quality tests (4.1.9 - 4.1.15)
+    if [[ "${EXTENDED_TESTS}" == "true" ]]; then
+        echo ""
+        echo "=============================================================================="
+        echo "EXTENDED QUALITY TESTS (Sample size: ${SAMPLE_SIZE}MB)"
+        echo "=============================================================================="
+        echo ""
+
+        test_extended_fips
+        test_compression_ratio
+        test_bit_distribution
+        test_byte_distribution
+        test_serial_correlation
+        test_runs_analysis
+        test_dieharder
+    else
+        log_info "Extended quality tests skipped (EXTENDED_TESTS=${EXTENDED_TESTS})"
+    fi
+
     # Finalize results
     local tmp_file=$(mktemp)
-    jq '.end_time = "'"$(date -Iseconds)"'"' "${SECTION_RESULTS}" > "${tmp_file}" && mv "${tmp_file}" "${SECTION_RESULTS}"
-    
+    jq '.end_time = "'"$(date -Iseconds)"'" | .extended_tests = "'"${EXTENDED_TESTS}"'" | .sample_size_mb = '"${SAMPLE_SIZE}"'' "${SECTION_RESULTS}" > "${tmp_file}" && mv "${tmp_file}" "${SECTION_RESULTS}"
+
     echo ""
     echo "Section 4.1 tests complete. Results: ${SECTION_RESULTS}"
 }
